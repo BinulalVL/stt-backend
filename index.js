@@ -31,7 +31,8 @@ const db = admin.firestore();
 const server = http.createServer(app);
 
 // Attach WebSocket to same server
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({ server, path: "/ws" });
+
 
 wss.on("connection", (ws) => {
   console.log("Client connected");
@@ -51,12 +52,20 @@ wss.on("connection", (ws) => {
         const pcmData = Buffer.concat(audioBuffer);
         audioBuffer = [];
 
+        function pcm16ToFloat32(buffer) {
+  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.length);
+  const float32 = new Float32Array(buffer.length / 2);
+  for (let i = 0; i < buffer.length / 2; i++) {
+    const s = view.getInt16(i * 2, true); // little endian
+    float32[i] = s / 32768.0;
+  }
+  return float32;
+}
+
+
         // Convert PCM16 → WAV
-        const float32 = new Float32Array(
-          pcmData.buffer,
-          pcmData.byteOffset,
-          pcmData.length / 2
-        );
+        const float32 = pcm16ToFloat32(pcmData);
+        
         const audioData = {
           sampleRate: 16000,
           channelData: [float32],
