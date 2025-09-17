@@ -7,36 +7,31 @@ const WavEncoder = require("wav-encoder");
 const dotenv = require("dotenv");
 const cors = require("cors");
 const http = require("http");
-const path = require("path");
 
 dotenv.config();
 
 const app = express();
 app.use(cors());
 
-// Health check
 app.get("/", (req, res) => {
   res.send("✅ STT Backend is running...");
 });
 
-// 🔑 OpenAI setup
-if (!process.env.OPENAI_KEY) {
-  console.error("❌ Missing OPENAI_KEY in environment");
-  process.exit(1);
-}
+// 🔑 Load ENV
 const openai = new OpenAI({ apiKey: process.env.OPENAI_KEY });
 
-// 🔑 Firebase setup (service account via GOOGLE_APPLICATION_CREDENTIALS)
+// Firebase setup (make sure GOOGLE_APPLICATION_CREDENTIALS is set)
 admin.initializeApp({
   credential: admin.credential.applicationDefault(),
 });
 const db = admin.firestore();
 
-// HTTP + WebSocket server
+// Create one HTTP server for Express + WS
 const server = http.createServer(app);
+
+// Attach WebSocket to same server
 const wss = new WebSocketServer({ server, path: "/ws" });
 
-// 🔊 PCM16 → Float32
 function pcm16ToFloat32(buffer) {
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.length);
   const float32 = new Float32Array(buffer.length / 2);
@@ -48,7 +43,7 @@ function pcm16ToFloat32(buffer) {
 }
 
 wss.on("connection", (ws) => {
-  console.log("🎤 Client connected");
+  console.log("Client connected");
 
   let audioBuffer = [];
 
@@ -56,64 +51,75 @@ wss.on("connection", (ws) => {
     try {
       const { meetingId, userId, audio } = JSON.parse(msg.toString());
 
-      if (!meetingId || !userId || !audio) {
-        return ws.send(JSON.stringify({ error: "Invalid payload" }));
-      }
-
       // Decode Base64 PCM chunk
       const audioChunk = Buffer.from(audio, "base64");
       audioBuffer.push(audioChunk);
 
-      // Process after ~20 chunks
-      if (audioBuffer.length >= 20) {
+      // Flush every ~100 chunks (≈ 5s depending on stream size)
+      if (audioBuffer.length > 100) {
         const pcmData = Buffer.concat(audioBuffer);
         audioBuffer = [];
 
+        // Convert PCM16 → WAV
         const float32 = pcm16ToFloat32(pcmData);
-
         const audioData = {
           sampleRate: 16000,
           channelData: [float32],
         };
 
-        const wavBuffer = await WavEncoder.encode(audioData);
-        const tempFile = path.join(__dirname, "temp.wav");
-        fs.writeFileSync(tempFile, Buffer.from(wavBuffer));
+        try {
+          const wavBuffer = await WavEncoder.encode(audioData);
+          await fs.promises.writeFile("temp.wav", Buffer.from(wavBuffer));
 
-        // 🎙️ Send to Whisper
-        const transcription = await openai.audio.transcriptions.create({
-          file: fs.createReadStream(tempFile),
-          model: "whisper-1",
-        });
-
-        const text = transcription.text.trim();
-        console.log("📝 Transcript:", text);
-
-        // Save to Firestore
-        await db
-          .collection("meetings")
-          .doc(meetingId)
-          .collection("transcripts")
-          .add({
-            senderId: userId,
-            text,
-            timestamp: Date.now(),
+          // Transcribe with Whisper
+          const transcription = await openai.audio.transcriptions.create({
+            file: fs.createReadStream("temp.wav"),
+            model: "whisper-1",
           });
 
-        // Send back to Flutter client
-        ws.send(JSON.stringify({ text }));
+          const text = transcription.text || "";
+          console.log("Transcript:", text);
+
+          // Save to Firestore
+          await db
+            .collection("meetings")
+            .doc(meetingId)
+            .collection("transcripts")
+            .add({
+              senderId: userId,
+              text,
+              timestamp: Date.now(),
+            });
+
+          // Send back to client
+          ws.send(JSON.stringify({ text }));
+        } catch (err) {
+          console.error(
+            "❌ Whisper API Error:",
+            err.response ? err.response.data : err.message
+          );
+          ws.send(
+            JSON.stringify({
+              error: "Transcription failed",
+              details: err.message,
+            })
+          );
+        }
       }
     } catch (err) {
-      console.error("❌ Error handling message:", err);
-      ws.send(JSON.stringify({ error: "Transcription failed" }));
+      console.error("❌ General Error:", err.message);
+      ws.send(
+        JSON.stringify({
+          error: "Processing failed",
+          details: err.message,
+        })
+      );
     }
   });
-
-  ws.on("close", () => console.log("❌ Client disconnected"));
 });
 
-// Start server
+// Start HTTP + WebSocket server
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
-  console.log(`🚀 HTTP + WS Server running on port ${PORT}`);
+  console.log(`🚀 HTTP Server listening on port ${PORT}`);
 });
